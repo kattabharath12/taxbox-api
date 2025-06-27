@@ -5,13 +5,10 @@ build:
     build:
       - pip install -r requirements.txt
 run:
-  runtime-version: 3.11
+  runtime-version: 3.9
   command: uvicorn main:app --host 0.0.0.0 --port 8000
   network:
     port: 8000
-    env: PORT
   env:
     - name: SECRET_KEY
-      value: "your-very-secure-secret-key-32-characters-long"
-    - name: DATABASE_URL
-      value: "sqlite:///./taxbox.db"
+      value: "test-secret-key-123456789"
