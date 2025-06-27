@@ -1,1069 +1,1542 @@
-"""
-FastAPI – Secure Tax Preparation Service with Data Collection
------------------------------------------------------------
-Enhanced with comprehensive tax data collection, document processing,
-and third-party integrations for payroll/bank/tax software imports.
-"""
-import json
+# Create the complete AWS-deployable tax form system
 import os
-import re
+
+# Create the main application file
+app_code = '''
+import hashlib
+import secrets
+import sqlite3
+import os
 import uuid
-from datetime import datetime, timedelta
-from decimal import Decimal
+import json
+from datetime import datetime, timedelta, date
+import re
+import io
+import mimetypes
+from pathlib import Path
 from enum import Enum
-from typing import List, Optional, Dict, Any, Union
-from io import BytesIO
-import base64
+from flask import Flask, request, jsonify, render_template_string, send_from_directory
+import threading
+import time
+import logging
+from werkzeug.utils import secure_filename
 
-import pyotp
-import uvicorn
-from fastapi import (
-    BackgroundTasks,
-    Depends,
-    FastAPI,
-    File,
-    Form,
-    HTTPException,
-    UploadFile,
-    status,
-)
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.middleware.cors import CORSMiddleware
-from jose import JWTError, jwt
-from passlib.hash import bcrypt
-from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    Integer,
-    JSON,
-    String,
-    Text,
-    Numeric,
-    create_engine,
-    ForeignKey,
-    Enum as SQLEnum,
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session, sessionmaker, relationship
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-try:
-    import PyPDF2
-    PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-import requests
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ────────────────────────────────────────────────────────────
-# CONFIGURATION
-# ────────────────────────────────────────────────────────────
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./taxbox.db")
-SECRET_KEY = os.getenv("SECRET_KEY", "INSECURE_DEMO_KEY")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MIN = 60 * 24
+class FormType(Enum):
+    W2 = "W-2"
+    FORM_1099_MISC = "1099-MISC"
+    FORM_1099_NEC = "1099-NEC"
+    FORM_1099_INT = "1099-INT"
+    FORM_1099_DIV = "1099-DIV"
 
-UPLOAD_DIR = "./uploads"
-PROCESSED_DIR = "./processed"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(PROCESSED_DIR, exist_ok=True)
+class StepStatus(Enum):
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    REQUIRES_REVIEW = "requires_review"
+    ERROR = "error"
+    AUTO_FILLED = "auto_filled"
 
-# Database setup
-engine = create_engine(
-    DATABASE_URL,
-    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+class AutoFillSource(Enum):
+    OCR_EXTRACTION = "ocr_extraction"
+    PREVIOUS_FORM = "previous_form"
+    USER_PROFILE = "user_profile"
+    EMPLOYER_DATABASE = "employer_database"
+    MANUAL_ENTRY = "manual_entry"
 
-# ────────────────────────────────────────────────────────────
-# ENUMS
-# ────────────────────────────────────────────────────────────
-class FilingStatus(str, Enum):
-    SINGLE = "single"
-    MARRIED_FILING_JOINTLY = "married_filing_jointly"
-    MARRIED_FILING_SEPARATELY = "married_filing_separately"
-    HEAD_OF_HOUSEHOLD = "head_of_household"
-    QUALIFYING_WIDOW = "qualifying_widow"
+class PaymentStatus(Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    REFUNDED = "refunded"
 
-class IncomeType(str, Enum):
-    W2 = "w2"
-    FORM_1099_MISC = "1099_misc"
-    FORM_1099_NEC = "1099_nec"
-    FORM_1099_INT = "1099_int"
-    FORM_1099_DIV = "1099_div"
-    FORM_1099_B = "1099_b"
-    SELF_EMPLOYMENT = "self_employment"
-    RENTAL = "rental"
-    BUSINESS = "business"
-    RETIREMENT = "retirement"
-    UNEMPLOYMENT = "unemployment"
-    OTHER = "other"
+class SubmissionStatus(Enum):
+    IN_PROGRESS = "in_progress"
+    SUBMITTED = "submitted"
+    PROCESSING = "processing"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
-class DeductionType(str, Enum):
-    STANDARD = "standard"
-    ITEMIZED = "itemized"
-
-class DocumentType(str, Enum):
-    W2 = "w2"
-    FORM_1099 = "1099"
-    RECEIPT = "receipt"
-    BANK_STATEMENT = "bank_statement"
-    INVESTMENT_STATEMENT = "investment_statement"
-    MORTGAGE_STATEMENT = "mortgage_statement"
-    PROPERTY_TAX = "property_tax"
-    CHARITABLE_DONATION = "charitable_donation"
-    MEDICAL_EXPENSE = "medical_expense"
-    EDUCATION_EXPENSE = "education_expense"
-    OTHER = "other"
-
-class ImportProvider(str, Enum):
-    ADP = "adp"
-    PAYCHEX = "paychex"
-    QUICKBOOKS = "quickbooks"
-    CHASE = "chase"
-    BANK_OF_AMERICA = "bank_of_america"
-    WELLS_FARGO = "wells_fargo"
-    TURBOTAX = "turbotax"
-    HR_BLOCK = "hr_block"
-    OTHER = "other"
-
-# ────────────────────────────────────────────────────────────
-# DATABASE MODELS
-# ────────────────────────────────────────────────────────────
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = "users"
+class CompleteTaxFormSystem:
+    def __init__(self, db_path=None, upload_dir=None):
+        # AWS-compatible paths
+        self.db_path = db_path or os.environ.get('DB_PATH', '/tmp/complete_tax_system.db')
+        self.upload_dir = upload_dir or os.environ.get('UPLOAD_DIR', '/tmp/uploads')
+        
+        self.valid_states = ["Texas", "New York", "California", "Florida", "Illinois", "Washington", "Oregon"]
+        self.allowed_extensions = {'.jpg', '.jpeg', '.png', '.pdf', '.tiff', '.tif'}
+        self.max_file_size = 10 * 1024 * 1024  # 10MB
+        
+        # Create directories
+        try:
+            os.makedirs(self.upload_dir, exist_ok=True)
+            os.makedirs(os.path.join(self.upload_dir, "processed"), exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create directories: {e}")
+        
+        # Initialize configurations
+        self.form_wizards = self.initialize_form_wizards()
+        self.ocr_field_mappings = self.initialize_ocr_mappings()
+        self.payment_config = self.initialize_payment_config()
+        
+        # Initialize database
+        self.init_database()
+        
+        # Start background status updater
+        self.start_background_status_updater()
     
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    password_hash = Column(String, nullable=False)
-    mfa_secret = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
-    identity_verified = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    def initialize_form_wizards(self):
+        """Initialize complete form wizard configurations"""
+        return {
+            FormType.W2.value: {
+                "title": "W-2 Wage and Tax Statement",
+                "description": "Complete your W-2 form step by step with auto-fill and payment",
+                "estimated_time": "10-15 minutes",
+                "auto_fill_sources": ["user_profile", "previous_form", "ocr_extraction"],
+                "processing_fee": 9.99,
+                "steps": [
+                    {
+                        "id": "employer_info",
+                        "title": "Employer Information",
+                        "description": "Enter your employer's details",
+                        "auto_fill_enabled": True,
+                        "fields": [
+                            {
+                                "name": "employer_name", 
+                                "type": "text", 
+                                "label": "Employer Name", 
+                                "required": True, 
+                                "validation": "text",
+                                "auto_fill_sources": ["ocr_extraction", "previous_form"],
+                                "confidence_threshold": 0.8
+                            },
+                            {
+                                "name": "employer_ein", 
+                                "type": "text", 
+                                "label": "Employer EIN", 
+                                "required": True, 
+                                "validation": "ein", 
+                                "placeholder": "XX-XXXXXXX",
+                                "auto_fill_sources": ["ocr_extraction", "previous_form"],
+                                "confidence_threshold": 0.9
+                            },
+                            {
+                                "name": "employer_address", 
+                                "type": "textarea", 
+                                "label": "Employer Address", 
+                                "required": True,
+                                "auto_fill_sources": ["ocr_extraction", "previous_form"],
+                                "confidence_threshold": 0.7
+                            },
+                            {
+                                "name": "employer_city", 
+                                "type": "text", 
+                                "label": "City", 
+                                "required": True,
+                                "auto_fill_sources": ["ocr_extraction", "previous_form"],
+                                "confidence_threshold": 0.8
+                            },
+                            {
+                                "name": "employer_state", 
+                                "type": "select", 
+                                "label": "State", 
+                                "required": True, 
+                                "options": self.valid_states,
+                                "auto_fill_sources": ["ocr_extraction", "previous_form"],
+                                "confidence_threshold": 0.8
+                            },
+                            {
+                                "name": "employer_zip", 
+                                "type": "text", 
+                                "label": "ZIP Code", 
+                                "required": True, 
+                                "validation": "zip",
+                                "auto_fill_sources": ["ocr_extraction", "previous_form"],
+                                "confidence_threshold": 0.9
+                            }
+                        ]
+                    },
+                    {
+                        "id": "employee_info",
+                        "title": "Employee Information",
+                        "description": "Verify your personal information",
+                        "auto_fill_enabled": True,
+                        "fields": [
+                            {
+                                "name": "employee_ssn", 
+                                "type": "text", 
+                                "label": "Your SSN", 
+                                "required": True, 
+                                "validation": "ssn", 
+                                "placeholder": "XXX-XX-XXXX",
+                                "auto_fill_sources": ["user_profile", "ocr_extraction"],
+                                "confidence_threshold": 0.95
+                            },
+                            {
+                                "name": "employee_name", 
+                                "type": "text", 
+                                "label": "Your Full Name", 
+                                "required": True,
+                                "auto_fill_sources": ["user_profile", "ocr_extraction"],
+                                "confidence_threshold": 0.8
+                            },
+                            {
+                                "name": "employee_address", 
+                                "type": "textarea", 
+                                "label": "Your Address", 
+                                "required": True,
+                                "auto_fill_sources": ["user_profile", "ocr_extraction"],
+                                "confidence_threshold": 0.7
+                            },
+                            {
+                                "name": "employee_city", 
+                                "type": "text", 
+                                "label": "City", 
+                                "required": True,
+                                "auto_fill_sources": ["user_profile", "ocr_extraction"],
+                                "confidence_threshold": 0.8
+                            },
+                            {
+                                "name": "employee_state", 
+                                "type": "select", 
+                                "label": "State", 
+                                "required": True, 
+                                "options": self.valid_states,
+                                "auto_fill_sources": ["user_profile", "ocr_extraction"],
+                                "confidence_threshold": 0.8
+                            },
+                            {
+                                "name": "employee_zip", 
+                                "type": "text", 
+                                "label": "ZIP Code", 
+                                "required": True, 
+                                "validation": "zip",
+                                "auto_fill_sources": ["user_profile", "ocr_extraction"],
+                                "confidence_threshold": 0.9
+                            }
+                        ]
+                    },
+                    {
+                        "id": "wage_info",
+                        "title": "Wage and Tax Information",
+                        "description": "Enter wage and tax withholding amounts",
+                        "auto_fill_enabled": True,
+                        "fields": [
+                            {
+                                "name": "wages", 
+                                "type": "currency", 
+                                "label": "Wages, tips, other compensation (Box 1)", 
+                                "required": True, 
+                                "validation": "currency",
+                                "auto_fill_sources": ["ocr_extraction"],
+                                "confidence_threshold": 0.85
+                            },
+                            {
+                                "name": "federal_tax", 
+                                "type": "currency", 
+                                "label": "Federal income tax withheld (Box 2)", 
+                                "required": True, 
+                                "validation": "currency",
+                                "auto_fill_sources": ["ocr_extraction"],
+                                "confidence_threshold": 0.85
+                            },
+                            {
+                                "name": "social_security_wages", 
+                                "type": "currency", 
+                                "label": "Social security wages (Box 3)", 
+                                "required": False, 
+                                "validation": "currency",
+                                "auto_fill_sources": ["ocr_extraction"],
+                                "confidence_threshold": 0.85
+                            },
+                            {
+                                "name": "social_security_tax", 
+                                "type": "currency", 
+                                "label": "Social security tax withheld (Box 4)", 
+                                "required": False, 
+                                "validation": "currency",
+                                "auto_fill_sources": ["ocr_extraction"],
+                                "confidence_threshold": 0.85
+                            },
+                            {
+                                "name": "medicare_wages", 
+                                "type": "currency", 
+                                "label": "Medicare wages and tips (Box 5)", 
+                                "required": False, 
+                                "validation": "currency",
+                                "auto_fill_sources": ["ocr_extraction"],
+                                "confidence_threshold": 0.85
+                            },
+                            {
+                                "name": "medicare_tax", 
+                                "type": "currency", 
+                                "label": "Medicare tax withheld (Box 6)", 
+                                "required": False, 
+                                "validation": "currency",
+                                "auto_fill_sources": ["ocr_extraction"],
+                                "confidence_threshold": 0.85
+                            }
+                        ]
+                    },
+                    {
+                        "id": "document_upload",
+                        "title": "Document Upload",
+                        "description": "Upload your W-2 document for auto-fill and verification",
+                        "auto_fill_enabled": False,
+                        "fields": [
+                            {
+                                "name": "document_file", 
+                                "type": "file", 
+                                "label": "Upload W-2 Document", 
+                                "required": True, 
+                                "accept": ".jpg,.jpeg,.png,.pdf,.tiff,.tif"
+                            }
+                        ]
+                    },
+                    {
+                        "id": "payment",
+                        "title": "Payment Information",
+                        "description": "Complete payment for form processing",
+                        "auto_fill_enabled": False,
+                        "fields": [
+                            {
+                                "name": "payment_type",
+                                "type": "select",
+                                "label": "Payment Type",
+                                "required": True,
+                                "options": ["Processing Fee", "Tax Payment", "Refund Request"]
+                            },
+                            {
+                                "name": "amount",
+                                "type": "currency",
+                                "label": "Amount",
+                                "required": True,
+                                "validation": "currency"
+                            },
+                            {
+                                "name": "payment_method",
+                                "type": "select",
+                                "label": "Payment Method",
+                                "required": True,
+                                "options": ["Stripe", "PayPal"]
+                            }
+                        ]
+                    },
+                    {
+                        "id": "review",
+                        "title": "Review and Edit",
+                        "description": "Review all auto-filled data, make edits, and confirm payment",
+                        "auto_fill_enabled": False,
+                        "review_step": True,
+                        "fields": [
+                            {
+                                "name": "data_confirmation", 
+                                "type": "checkbox", 
+                                "label": "I confirm that all information is accurate after review", 
+                                "required": True
+                            },
+                            {
+                                "name": "payment_confirmation", 
+                                "type": "checkbox", 
+                                "label": "I authorize the payment for form processing", 
+                                "required": True
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
     
-    profile = relationship("Profile", back_populates="user", uselist=False)
-    tax_profile = relationship("TaxProfile", back_populates="user", uselist=False)
-    documents = relationship("Document", back_populates="user")
-    kba = relationship("KBA", back_populates="user", uselist=False)
-    income_records = relationship("IncomeRecord", back_populates="user")
-    deduction_records = relationship("DeductionRecord", back_populates="user")
-    import_sessions = relationship("ImportSession", back_populates="user")
-
-class Profile(Base):
-    __tablename__ = "profiles"
+    def initialize_ocr_mappings(self):
+        """Initialize OCR field mapping configurations"""
+        return {
+            FormType.W2.value: {
+                "box_mappings": {
+                    "1": "wages",
+                    "2": "federal_tax",
+                    "3": "social_security_wages",
+                    "4": "social_security_tax",
+                    "5": "medicare_wages",
+                    "6": "medicare_tax"
+                },
+                "text_patterns": {
+                    "employer_ein": r'\\b\\d{2}-\\d{7}\\b',
+                    "employee_ssn": r'\\b\\d{3}-\\d{2}-\\d{4}\\b',
+                    "zip_code": r'\\b\\d{5}(-\\d{4})?\\b',
+                    "currency": r'\\$?[\\d,]+\\.?\\d{0,2}'
+                }
+            }
+        }
     
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    first_name = Column(String)
-    last_name = Column(String)
-    date_of_birth = Column(String)
-    phone = Column(String)
-    address = Column(String)
-    dependents = Column(JSON, default=list)
+    def initialize_payment_config(self):
+        """Initialize payment configuration"""
+        return {
+            "stripe": {
+                "publishable_key": os.environ.get('STRIPE_PUBLISHABLE_KEY', 'pk_test_51234567890abcdef'),
+                "secret_key": os.environ.get('STRIPE_SECRET_KEY', 'sk_test_51234567890abcdef'),
+                "webhook_secret": os.environ.get('STRIPE_WEBHOOK_SECRET', 'whsec_test_123456789')
+            },
+            "paypal": {
+                "client_id": os.environ.get('PAYPAL_CLIENT_ID', 'sb'),
+                "client_secret": os.environ.get('PAYPAL_CLIENT_SECRET', 'test_secret'),
+                "mode": os.environ.get('PAYPAL_MODE', 'sandbox')
+            },
+            "processing_fees": {
+                FormType.W2.value: 9.99,
+                FormType.FORM_1099_MISC.value: 7.99
+            }
+        }
     
-    user = relationship("User", back_populates="profile")
-
-class TaxProfile(Base):
-    __tablename__ = "tax_profiles"
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    ssn = Column(String)  # Encrypted in production
-    spouse_ssn = Column(String, nullable=True)
-    filing_status = Column(SQLEnum(FilingStatus))
-    state = Column(String)
-    address_line1 = Column(String)
-    address_line2 = Column(String, nullable=True)
-    city = Column(String)
-    zip_code = Column(String)
-    occupation = Column(String, nullable=True)
-    spouse_occupation = Column(String, nullable=True)
-    bank_routing = Column(String, nullable=True)
-    bank_account = Column(String, nullable=True)
-    prior_year_agi = Column(Numeric(12, 2), nullable=True)
-    
-    user = relationship("User", back_populates="tax_profile")
-
-class IncomeRecord(Base):
-    __tablename__ = "income_records"
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    income_type = Column(SQLEnum(IncomeType))
-    employer_name = Column(String, nullable=True)
-    employer_ein = Column(String, nullable=True)
-    gross_income = Column(Numeric(12, 2))
-    federal_withholding = Column(Numeric(12, 2), default=0)
-    state_withholding = Column(Numeric(12, 2), default=0)
-    social_security_wages = Column(Numeric(12, 2), default=0)
-    medicare_wages = Column(Numeric(12, 2), default=0)
-    state_wages = Column(Numeric(12, 2), default=0)
-    additional_data = Column(JSON, default=dict)  # For form-specific fields
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    user = relationship("User", back_populates="income_records")
-    document = relationship("Document")
-
-class DeductionRecord(Base):
-    __tablename__ = "deduction_records"
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    deduction_type = Column(SQLEnum(DeductionType))
-    category = Column(String)  # mortgage_interest, charitable, medical, etc.
-    description = Column(String)
-    amount = Column(Numeric(12, 2))
-    state_specific = Column(Boolean, default=False)
-    state = Column(String, nullable=True)
-    additional_data = Column(JSON, default=dict)
-    document_id = Column(Integer, ForeignKey("documents.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    
-    user = relationship("User", back_populates="deduction_records")
-    document = relationship("Document")
-
-class Document(Base):
-    __tablename__ = "documents"
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    filename = Column(String, nullable=False)
-    original_filename = Column(String, nullable=False)
-    document_type = Column(SQLEnum(DocumentType))
-    file_path = Column(String, nullable=False)
-    file_size = Column(Integer)
-    mime_type = Column(String)
-    processed = Column(Boolean, default=False)
-    extracted_data = Column(JSON, default=dict)
-    uploaded_at = Column(DateTime, default=datetime.utcnow)
-    
-    user = relationship("User", back_populates="documents")
-
-class ImportSession(Base):
-    __tablename__ = "import_sessions"
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    provider = Column(SQLEnum(ImportProvider))
-    session_token = Column(String, nullable=True)
-    status = Column(String, default="pending")  # pending, success, failed
-    imported_data = Column(JSON, default=dict)
-    error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    completed_at = Column(DateTime, nullable=True)
-    
-    user = relationship("User", back_populates="import_sessions")
-
-class KBA(Base):
-    __tablename__ = "kba"
-    
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    questions = Column(JSON)
-    answers = Column(JSON)
-    verified = Column(Boolean, default=False)
-    
-    user = relationship("User", back_populates="kba")
-
-# Create tables AFTER all models are defined
-Base.metadata.create_all(bind=engine)
-
-# ────────────────────────────────────────────────────────────
-# PYDANTIC SCHEMAS
-# ────────────────────────────────────────────────────────────
-class Dependent(BaseModel):
-    name: str
-    relationship: str
-    ssn: Optional[str] = None
-    dob: Optional[str] = None
-    months_lived_with_you: Optional[int] = None
-    student: Optional[bool] = False
-    disabled: Optional[bool] = False
-
-class TaxProfileIn(BaseModel):
-    ssn: str = Field(regex=r'^\d{3}-\d{2}-\d{4}$')
-    spouse_ssn: Optional[str] = Field(None, regex=r'^\d{3}-\d{2}-\d{4}$')
-    filing_status: FilingStatus
-    state: str = Field(max_length=2)
-    address_line1: str
-    address_line2: Optional[str] = None
-    city: str
-    zip_code: str = Field(regex=r'^\d{5}(-\d{4})?$')
-    occupation: Optional[str] = None
-    spouse_occupation: Optional[str] = None
-    bank_routing: Optional[str] = Field(None, regex=r'^\d{9}$')
-    bank_account: Optional[str] = None
-    prior_year_agi: Optional[Decimal] = None
-
-class W2IncomeIn(BaseModel):
-    employer_name: str
-    employer_ein: str = Field(regex=r'^\d{2}-\d{7}$')
-    gross_income: Decimal = Field(ge=0)
-    federal_withholding: Decimal = Field(ge=0, default=0)
-    state_withholding: Decimal = Field(ge=0, default=0)
-    social_security_wages: Decimal = Field(ge=0, default=0)
-    medicare_wages: Decimal = Field(ge=0, default=0)
-    state_wages: Decimal = Field(ge=0, default=0)
-    retirement_plan: Optional[bool] = False
-    statutory_employee: Optional[bool] = False
-
-class Form1099In(BaseModel):
-    payer_name: str
-    payer_tin: str = Field(regex=r'^\d{2}-\d{7}$')
-    income_type: IncomeType
-    amount: Decimal = Field(ge=0)
-    federal_withholding: Optional[Decimal] = Field(ge=0, default=0)
-    state_withholding: Optional[Decimal] = Field(ge=0, default=0)
-    additional_info: Optional[Dict[str, Any]] = {}
-
-class SelfEmploymentIn(BaseModel):
-    business_name: Optional[str] = None
-    business_type: str
-    gross_receipts: Decimal = Field(ge=0)
-    total_expenses: Decimal = Field(ge=0, default=0)
-    net_profit: Decimal
-    schedule_c_expenses: Optional[Dict[str, Decimal]] = {}
-
-class ItemizedDeductionIn(BaseModel):
-    category: str  # mortgage_interest, property_tax, charitable, medical, etc.
-    description: str
-    amount: Decimal = Field(ge=0)
-    state_specific: bool = False
-    state: Optional[str] = None
-    supporting_documents: Optional[List[str]] = []
-
-class EducationCreditIn(BaseModel):
-    student_name: str
-    student_ssn: str = Field(regex=r'^\d{3}-\d{2}-\d{4}$')
-    institution_name: str
-    institution_ein: str = Field(regex=r'^\d{2}-\d{7}$')
-    tuition_paid: Decimal = Field(ge=0)
-    qualified_expenses: Decimal = Field(ge=0)
-    form_1098t_received: bool = False
-
-class ChildTaxCreditIn(BaseModel):
-    child_name: str
-    child_ssn: str = Field(regex=r'^\d{3}-\d{2}-\d{4}$')
-    relationship: str
-    months_lived_with_you: int = Field(ge=0, le=12)
-    under_age_17: bool
-    us_citizen: bool = True
-
-class StateSpecificIn(BaseModel):
-    state: str = Field(max_length=2)
-    deduction_type: str
-    amount: Decimal = Field(ge=0)
-    description: str
-    additional_data: Optional[Dict[str, Any]] = {}
-
-class ImportRequestIn(BaseModel):
-    provider: ImportProvider
-    credentials: Dict[str, str]  # username, password, account_id, etc.
-    data_types: List[str] = ["income", "deductions", "documents"]
-
-# Response Models
-class TaxProfileOut(BaseModel):
-    filing_status: FilingStatus
-    state: str
-    address_line1: str
-    city: str
-    zip_code: str
-    occupation: Optional[str]
-    
-    class Config:
-        orm_mode = True
-
-class IncomeRecordOut(BaseModel):
-    id: int
-    income_type: IncomeType
-    employer_name: Optional[str]
-    gross_income: Decimal
-    federal_withholding: Decimal
-    created_at: datetime
-    
-    class Config:
-        orm_mode = True
-
-class DeductionRecordOut(BaseModel):
-    id: int
-    deduction_type: DeductionType
-    category: str
-    description: str
-    amount: Decimal
-    state_specific: bool
-    created_at: datetime
-    
-    class Config:
-        orm_mode = True
-
-class DocumentOut(BaseModel):
-    id: int
-    filename: str
-    document_type: DocumentType
-    file_size: int
-    processed: bool
-    uploaded_at: datetime
-    
-    class Config:
-        orm_mode = True
-
-# ────────────────────────────────────────────────────────────
-# FASTAPI APP & DEPENDENCIES
-# ────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="TaxBox.AI - Comprehensive Tax Preparation Service",
-    description="Secure tax preparation API with document processing and third-party integrations",
-    version="1.0.0"
-)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise credentials_exception
-    return user
-
-# ────────────────────────────────────────────────────────────
-# UTILITY FUNCTIONS
-# ────────────────────────────────────────────────────────────
-def process_document(file_path: str, document_type: DocumentType) -> Dict[str, Any]:
-    """Extract data from uploaded documents using OCR/parsing"""
-    extracted_data = {"message": "Document processing available in production"}
-    
-    try:
-        if PDF_AVAILABLE and file_path.endswith('.pdf'):
-            extracted_data = extract_pdf_data(file_path, document_type)
-        elif PIL_AVAILABLE and any(file_path.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.tiff']):
-            extracted_data = extract_image_data(file_path, document_type)
-        else:
-            extracted_data = {"message": "File type processed successfully", "type": str(document_type)}
-    except Exception as e:
-        extracted_data = {"error": str(e)}
-    
-    return extracted_data
-
-def extract_pdf_data(file_path: str, document_type: DocumentType) -> Dict[str, Any]:
-    """Extract text and structured data from PDF documents"""
-    extracted_data = {"text": "", "structured_data": {}}
-    
-    if not PDF_AVAILABLE:
-        return {"message": "PDF processing not available in this environment"}
-    
-    try:
-        with open(file_path, 'rb') as file:
-            pdf_reader = PyPDF2.PdfReader(file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text()
+    def init_database(self):
+        """Initialize complete database with all required tables"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
             
-            extracted_data["text"] = text[:500]  # Limit text for demo
+            # Users table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    is_verified BOOLEAN DEFAULT FALSE,
+                    verification_token TEXT,
+                    mfa_enabled BOOLEAN DEFAULT FALSE,
+                    mfa_secret TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP
+                )
+            ''')
             
-            # Basic pattern matching for common tax forms
-            if document_type == DocumentType.W2:
-                extracted_data["structured_data"] = parse_w2_text(text)
-            elif document_type == DocumentType.FORM_1099:
-                extracted_data["structured_data"] = parse_1099_text(text)
+            # User profiles table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER UNIQUE NOT NULL,
+                    first_name TEXT,
+                    last_name TEXT,
+                    ssn_encrypted TEXT,
+                    date_of_birth DATE,
+                    address_line1 TEXT,
+                    address_line2 TEXT,
+                    city TEXT,
+                    state TEXT,
+                    zip_code TEXT,
+                    profile_completed BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Form wizard sessions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS form_wizard_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    form_type TEXT NOT NULL,
+                    session_id TEXT UNIQUE NOT NULL,
+                    current_step_id TEXT NOT NULL,
+                    current_step_index INTEGER DEFAULT 0,
+                    total_steps INTEGER NOT NULL,
+                    form_data TEXT,
+                    step_statuses TEXT,
+                    auto_fill_data TEXT,
+                    manual_overrides TEXT,
+                    payment_data TEXT,
+                    progress_percentage INTEGER DEFAULT 0,
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    is_completed BOOLEAN DEFAULT FALSE,
+                    payment_required BOOLEAN DEFAULT TRUE,
+                    payment_completed BOOLEAN DEFAULT FALSE,
+                    submission_status TEXT DEFAULT 'in_progress',
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Payments table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    payment_intent_id TEXT UNIQUE,
+                    paypal_order_id TEXT,
+                    amount REAL NOT NULL,
+                    currency TEXT DEFAULT 'USD',
+                    payment_method TEXT NOT NULL,
+                    payment_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    stripe_payment_method_id TEXT,
+                    paypal_capture_id TEXT,
+                    failure_reason TEXT,
+                    refund_id TEXT,
+                    refund_amount REAL,
+                    refund_reason TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Auto-fill audit table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS auto_fill_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    field_name TEXT NOT NULL,
+                    auto_fill_source TEXT NOT NULL,
+                    original_value TEXT,
+                    confidence_score REAL,
+                    user_accepted BOOLEAN DEFAULT NULL,
+                    user_modified_value TEXT,
+                    modification_timestamp TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Document uploads table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS document_uploads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    session_id TEXT,
+                    document_type TEXT NOT NULL,
+                    original_filename TEXT NOT NULL,
+                    stored_filename TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    upload_method TEXT NOT NULL,
+                    processing_status TEXT DEFAULT 'pending',
+                    ocr_extracted_data TEXT,
+                    ocr_confidence_scores TEXT,
+                    auto_fill_applied BOOLEAN DEFAULT FALSE,
+                    extracted_data TEXT,
+                    verification_status TEXT DEFAULT 'unverified',
+                    upload_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    processed_timestamp TIMESTAMP,
+                    notes TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+                )
+            ''')
+            
+            # Form submissions table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS form_submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    session_id TEXT NOT NULL,
+                    form_type TEXT NOT NULL,
+                    form_data TEXT NOT NULL,
+                    document_ids TEXT,
+                    payment_id INTEGER,
+                    auto_fill_summary TEXT,
+                    manual_override_summary TEXT,
+                    submission_status TEXT DEFAULT 'submitted',
+                    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    processed_at TIMESTAMP,
+                    notes TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+                    FOREIGN KEY (payment_id) REFERENCES payments (id)
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+    
+    def start_background_status_updater(self):
+        """Start background thread to simulate status updates"""
+        def update_statuses():
+            while True:
+                try:
+                    time.sleep(30)  # Check every 30 seconds
+                    self.simulate_status_updates()
+                except Exception as e:
+                    logger.error(f"Status update error: {e}")
+        
+        thread = threading.Thread(target=update_statuses, daemon=True)
+        thread.start()
+    
+    def simulate_status_updates(self):
+        """Simulate realistic status updates for demo purposes"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Update submitted forms to processing after 1 minute
+            cursor.execute('''
+                UPDATE form_submissions 
+                SET submission_status = 'processing', processed_at = CURRENT_TIMESTAMP
+                WHERE submission_status = 'submitted' 
+                AND datetime(submitted_at, '+1 minute') <= datetime('now')
+            ''')
+            
+            # Update processing forms to approved after 2 minutes
+            cursor.execute('''
+                UPDATE form_submissions 
+                SET submission_status = 'approved'
+                WHERE submission_status = 'processing' 
+                AND datetime(processed_at, '+2 minutes') <= datetime('now')
+            ''')
+            
+            # Update wizard sessions status to match submissions
+            cursor.execute('''
+                UPDATE form_wizard_sessions 
+                SET submission_status = (
+                    SELECT submission_status FROM form_submissions 
+                    WHERE form_submissions.session_id = form_wizard_sessions.session_id
+                )
+                WHERE session_id IN (
+                    SELECT session_id FROM form_submissions
+                )
+            ''')
+            
+            conn.commit()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Status update simulation error: {e}")
+    
+    # Authentication methods
+    def validate_email(self, email):
+        """Validate email format"""
+        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$'
+        return re.match(pattern, email) is not None
+    
+    def hash_password(self, password, salt=None):
+        """Hash password with salt"""
+        if salt is None:
+            salt = secrets.token_hex(32)
+        
+        password_hash = hashlib.pbkdf2_hmac('sha256', 
+                                          password.encode('utf-8'), 
+                                          salt.encode('utf-8'), 
+                                          100000)
+        return password_hash.hex(), salt
+    
+    def register_user(self, email, password):
+        """Register a new user"""
+        try:
+            if not self.validate_email(email):
+                return {"success": False, "message": "Invalid email format"}
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+            if cursor.fetchone():
+                return {"success": False, "message": "Email already registered"}
+            
+            password_hash, salt = self.hash_password(password)
+            verification_token = secrets.token_urlsafe(32)
+            
+            cursor.execute('''
+                INSERT INTO users (email, password_hash, salt, verification_token)
+                VALUES (?, ?, ?, ?)
+            ''', (email, password_hash, salt, verification_token))
+            
+            user_id = cursor.lastrowid
+            
+            cursor.execute('''
+                INSERT INTO user_profiles (user_id) VALUES (?)
+            ''', (user_id,))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True, 
+                "message": "Registration successful",
+                "user_id": user_id
+            }
+            
+        except Exception as e:
+            logger.error(f"Registration error: {e}")
+            return {"success": False, "message": f"Registration failed: {str(e)}"}
+    
+    def login_user(self, email, password):
+        """Login user"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT id, password_hash, salt FROM users WHERE email = ?", (email,))
+            result = cursor.fetchone()
+            
+            if not result:
+                return {"success": False, "message": "Invalid email or password"}
+            
+            user_id, stored_hash, salt = result
+            password_hash, _ = self.hash_password(password, salt)
+            
+            if password_hash == stored_hash:
+                cursor.execute("UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user_id,))
+                conn.commit()
+                conn.close()
+                return {"success": True, "user_id": user_id, "message": "Login successful"}
+            else:
+                conn.close()
+                return {"success": False, "message": "Invalid email or password"}
                 
-    except Exception as e:
-        extracted_data["error"] = str(e)
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return {"success": False, "message": f"Login failed: {str(e)}"}
     
-    return extracted_data
+    # Form wizard methods
+    def start_form_wizard(self, user_id, form_type):
+        """Start a new form wizard session"""
+        try:
+            if form_type not in self.form_wizards:
+                return {"success": False, "message": "Invalid form type"}
+            
+            wizard_config = self.form_wizards[form_type]
+            session_id = str(uuid.uuid4())
+            
+            # Initialize step statuses
+            step_statuses = {}
+            for i, step in enumerate(wizard_config["steps"]):
+                step_statuses[step["id"]] = {
+                    "status": StepStatus.NOT_STARTED.value if i > 0 else StepStatus.IN_PROGRESS.value,
+                    "completed_at": None,
+                    "validation_errors": []
+                }
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+            if not cursor.fetchone():
+                return {"success": False, "message": "User not found"}
+            
+            processing_fee = self.payment_config["processing_fees"].get(form_type, 0.00)
+            
+            cursor.execute('''
+                INSERT INTO form_wizard_sessions (
+                    user_id, form_type, session_id, current_step_id, 
+                    current_step_index, total_steps, form_data, step_statuses,
+                    payment_required, payment_completed, submission_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, form_type, session_id, wizard_config["steps"][0]["id"],
+                0, len(wizard_config["steps"]), '{}', json.dumps(step_statuses),
+                True, False, 'in_progress'
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "session_id": session_id,
+                "wizard_config": wizard_config,
+                "current_step": wizard_config["steps"][0],
+                "processing_fee": processing_fee,
+                "progress": {
+                    "current_step": 1,
+                    "total_steps": len(wizard_config["steps"]),
+                    "percentage": 0
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Start wizard error: {e}")
+            return {"success": False, "message": f"Failed to start wizard: {str(e)}"}
+    
+    def get_session_data(self, user_id, session_id):
+        """Get session data for resuming"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT form_type, current_step_index, form_data, auto_fill_data, 
+                       payment_completed, submission_status
+                FROM form_wizard_sessions
+                WHERE user_id = ? AND session_id = ?
+            ''', (user_id, session_id))
+            
+            result = cursor.fetchone()
+            if not result:
+                return {"success": False, "message": "Session not found"}
+            
+            form_type, current_step_index, form_data_str, auto_fill_str, payment_completed, submission_status = result
+            
+            wizard_config = self.form_wizards[form_type]
+            
+            conn.close()
+            
+            return {
+                "success": True,
+                "wizard_config": wizard_config,
+                "current_step_index": current_step_index,
+                "current_step": wizard_config["steps"][current_step_index],
+                "form_data": json.loads(form_data_str) if form_data_str else {},
+                "auto_fill_data": json.loads(auto_fill_str) if auto_fill_str else {},
+                "payment_completed": payment_completed,
+                "submission_status": submission_status
+            }
+            
+        except Exception as e:
+            logger.error(f"Get session error: {e}")
+            return {"success": False, "message": f"Failed to get session: {str(e)}"}
+    
+    # OCR and Auto-fill methods
+    def extract_data_from_document(self, file_path, form_type):
+        """Extract data from uploaded document using OCR (mock implementation)"""
+        try:
+            # Mock OCR extraction with realistic data
+            mock_extracted_data = {
+                "employer_name": "ABC Corporation Inc.",
+                "employer_ein": "12-3456789",
+                "employer_address": "123 Business Ave",
+                "employer_city": "Austin",
+                "employer_state": "Texas",
+                "employer_zip": "78701",
+                "employee_name": "John Doe",
+                "employee_ssn": "123-45-6789",
+                "employee_address": "456 Main St",
+                "employee_city": "Austin",
+                "employee_state": "Texas",
+                "employee_zip": "78702",
+                "wages": "50000.00",
+                "federal_tax": "7500.00",
+                "social_security_wages": "50000.00",
+                "social_security_tax": "3100.00",
+                "medicare_wages": "50000.00",
+                "medicare_tax": "725.00"
+            }
+            
+            confidence_scores = {field: 0.85 + (hash(field) % 15) / 100 for field in mock_extracted_data.keys()}
+            
+            return {
+                "success": True,
+                "extracted_data": mock_extracted_data,
+                "confidence_scores": confidence_scores
+            }
+            
+        except Exception as e:
+            logger.error(f"OCR extraction error: {e}")
+            return {
+                "success": False,
+                "error": f"OCR extraction failed: {str(e)}"
+            }
+    
+    def apply_auto_fill_to_session(self, user_id, session_id, extracted_data):
+        """Apply auto-fill data to session"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT form_type, auto_fill_data FROM form_wizard_sessions
+                WHERE user_id = ? AND session_id = ?
+            ''', (user_id, session_id))
+            
+            result = cursor.fetchone()
+            if not result:
+                return {"success": False, "message": "Session not found"}
+            
+            form_type, existing_auto_fill = result
+            auto_fill_data = json.loads(existing_auto_fill) if existing_auto_fill else {}
+            
+            wizard_config = self.form_wizards[form_type]
+            
+            # Apply auto-fill to each step
+            for step in wizard_config["steps"]:
+                if step.get("auto_fill_enabled", False):
+                    step_id = step["id"]
+                    if step_id not in auto_fill_data:
+                        auto_fill_data[step_id] = {}
+                    
+                    for field in step["fields"]:
+                        field_name = field["name"]
+                        if field_name in extracted_data:
+                            auto_fill_data[step_id][field_name] = extracted_data[field_name]
+                            auto_fill_data[step_id][f"_auto_fill_source_{field_name}"] = AutoFillSource.OCR_EXTRACTION.value
+                            auto_fill_data[step_id][f"_confidence_{field_name}"] = 0.85
+            
+            cursor.execute('''
+                UPDATE form_wizard_sessions SET
+                    auto_fill_data = ?,
+                    last_updated = CURRENT_TIMESTAMP
+                WHERE user_id = ? AND session_id = ?
+            ''', (json.dumps(auto_fill_data), user_id, session_id))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "auto_fill_data": auto_fill_data,
+                "fields_auto_filled": len(extracted_data)
+            }
+            
+        except Exception as e:
+            logger.error(f"Auto-fill error: {e}")
+            return {"success": False, "message": f"Auto-fill failed: {str(e)}"}
+    
+    # Payment methods (mock implementations for AWS deployment)
+    def create_stripe_payment_intent(self, user_id, session_id, amount, payment_type):
+        """Create Stripe payment intent (mock for demo)"""
+        try:
+            payment_intent_id = f"pi_mock_{uuid.uuid4().hex[:16]}"
+            client_secret = f"{payment_intent_id}_secret_mock"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO payments (
+                    user_id, session_id, payment_intent_id, amount, 
+                    payment_method, payment_type, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, session_id, payment_intent_id, amount,
+                'Stripe', payment_type, 'pending'
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "client_secret": client_secret,
+                "payment_intent_id": payment_intent_id
+            }
+            
+        except Exception as e:
+            logger.error(f"Stripe payment error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def confirm_stripe_payment(self, payment_intent_id, payment_method_id):
+        """Confirm Stripe payment (mock for demo)"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE payments SET
+                    status = 'completed',
+                    stripe_payment_method_id = ?,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE payment_intent_id = ?
+            ''', (payment_method_id, payment_intent_id))
+            
+            cursor.execute('''
+                UPDATE form_wizard_sessions SET
+                    payment_completed = 1
+                WHERE session_id = (
+                    SELECT session_id FROM payments WHERE payment_intent_id = ?
+                )
+            ''', (payment_intent_id,))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "status": "completed"
+            }
+            
+        except Exception as e:
+            logger.error(f"Stripe confirm error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def create_paypal_order(self, user_id, session_id, amount, payment_type):
+        """Create PayPal order (mock for demo)"""
+        try:
+            order_id = f"PAYPAL_{uuid.uuid4().hex[:8].upper()}"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO payments (
+                    user_id, session_id, paypal_order_id, amount, 
+                    payment_method, payment_type, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, session_id, order_id, amount,
+                'PayPal', payment_type, 'pending'
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "order_id": order_id,
+                "approval_url": f"https://www.sandbox.paypal.com/checkoutnow?token={order_id}"
+            }
+            
+        except Exception as e:
+            logger.error(f"PayPal order error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def capture_paypal_payment(self, order_id):
+        """Capture PayPal payment (mock for demo)"""
+        try:
+            capture_id = f"CAPTURE_{uuid.uuid4().hex[:8].upper()}"
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE payments SET
+                    status = 'completed',
+                    paypal_capture_id = ?,
+                    completed_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE paypal_order_id = ?
+            ''', (capture_id, order_id))
+            
+            cursor.execute('''
+                UPDATE form_wizard_sessions SET
+                    payment_completed = 1
+                WHERE session_id = (
+                    SELECT session_id FROM payments WHERE paypal_order_id = ?
+                )
+            ''', (order_id,))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "capture_id": capture_id,
+                "status": "completed"
+            }
+            
+        except Exception as e:
+            logger.error(f"PayPal capture error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    # Dashboard and tracking methods
+    def get_dashboard_data(self, user_id):
+        """Get comprehensive dashboard data"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get in-progress sessions
+            cursor.execute('''
+                SELECT session_id, form_type, started_at, last_updated, 
+                       progress_percentage, submission_status, payment_completed
+                FROM form_wizard_sessions
+                WHERE user_id = ? AND is_completed = 0
+                ORDER BY last_updated DESC
+            ''', (user_id,))
+            
+            in_progress = []
+            for row in cursor.fetchall():
+                session_id, form_type, started_at, last_updated, progress, status, payment_completed = row
+                in_progress.append({
+                    "session_id": session_id,
+                    "form_type": form_type,
+                    "started_at": started_at,
+                    "last_updated": last_updated,
+                    "progress_percentage": progress or 0,
+                    "status": "In Progress",
+                    "payment_completed": bool(payment_completed),
+                    "can_resume": True
+                })
+            
+            # Get submitted forms
+            cursor.execute('''
+                SELECT fs.session_id, fs.form_type, fs.submitted_at, fs.submission_status,
+                       p.amount, p.payment_method, p.status as payment_status
+                FROM form_submissions fs
+                LEFT JOIN payments p ON fs.payment_id = p.id
+                WHERE fs.user_id = ?
+                ORDER BY fs.submitted_at DESC
+            ''', (user_id,))
+            
+            submissions = []
+            for row in cursor.fetchall():
+                session_id, form_type, submitted_at, status, amount, payment_method, payment_status = row
+                
+                display_status = {
+                    "submitted": "Submitted",
+                    "processing": "Processing", 
+                    "approved": "Accepted",
+                    "rejected": "Rejected"
+                }.get(status, status.capitalize() if status else "Unknown")
+                
+                submissions.append({
+                    "session_id": session_id,
+                    "form_type": form_type,
+                    "submitted_at": submitted_at,
+                    "status": display_status,
+                    "status_color": {
+                        "Submitted": "#007bff",
+                        "Processing": "#ffc107",
+                        "Accepted": "#28a745",
+                        "Rejected": "#dc3545"
+                    }.get(display_status, "#6c757d"),
+                    "payment_amount": amount,
+                    "payment_method": payment_method,
+                    "payment_status": payment_status
+                })
+            
+            # Get summary statistics
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_forms,
+                    SUM(CASE WHEN is_completed = 1 THEN 1 ELSE 0 END) as completed_forms,
+                    SUM(CASE WHEN payment_completed = 1 THEN 1 ELSE 0 END) as paid_forms
+                FROM form_wizard_sessions
+                WHERE user_id = ?
+            ''', (user_id,))
+            
+            stats = cursor.fetchone()
+            total_forms, completed_forms, paid_forms = stats if stats else (0, 0, 0)
+            
+            conn.close()
+            
+            return {
+                "success": True,
+                "dashboard_data": {
+                    "in_progress": in_progress,
+                    "submissions": submissions,
+                    "summary": {
+                        "total_forms": total_forms,
+                        "completed_forms": completed_forms,
+                        "in_progress_forms": len(in_progress),
+                        "paid_forms": paid_forms
+                    }
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Dashboard error: {e}")
+            return {"success": False, "message": f"Failed to get dashboard data: {str(e)}"}
+    
+    # Review and submission methods
+    def get_comprehensive_review_data(self, user_id, session_id):
+        """Get complete review data"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT form_type, form_data, auto_fill_data, manual_overrides, 
+                       payment_completed, payment_data
+                FROM form_wizard_sessions
+                WHERE user_id = ? AND session_id = ?
+            ''', (user_id, session_id))
+            
+            result = cursor.fetchone()
+            if not result:
+                return {"success": False, "message": "Session not found"}
+            
+            form_type, form_data_str, auto_fill_str, overrides_str, payment_completed, payment_data_str = result
+            
+            form_data = json.loads(form_data_str) if form_data_str else {}
+            auto_fill_data = json.loads(auto_fill_str) if auto_fill_str else {}
+            manual_overrides = json.loads(overrides_str) if overrides_str else {}
+            
+            # Get payment information
+            cursor.execute('''
+                SELECT amount, payment_method, payment_type, status, created_at
+                FROM payments
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            ''', (session_id,))
+            
+            payment_info = cursor.fetchone()
+            
+            wizard_config = self.form_wizards[form_type]
+            
+            review_data = {
+                "form_info": {
+                    "title": wizard_config["title"],
+                    "form_type": form_type,
+                    "processing_fee": wizard_config.get("processing_fee", 0.00)
+                },
+                "steps": {},
+                "payment_info": {
+                    "required": True,
+                    "completed": bool(payment_completed),
+                    "amount": payment_info[0] if payment_info else 0.00,
+                    "method": payment_info[1] if payment_info else None,
+                    "type": payment_info[2] if payment_info else None,
+                    "status": payment_info[3] if payment_info else "pending"
+                },
+                "summary": {
+                    "total_fields": 0,
+                    "auto_filled_fields": 0,
+                    "overridden_fields": 0,
+                    "manual_fields": 0
+                }
+            }
+            
+            # Process each step
+            for step in wizard_config["steps"]:
+                if step["id"] in ["review", "payment"]:
+                    continue
+                
+                step_id = step["id"]
+                step_form_data = form_data.get(step_id, {})
+                step_auto_fill = auto_fill_data.get(step_id, {})
+                step_overrides = manual_overrides.get(step_id, {})
+                
+                review_data["steps"][step_id] = {
+                    "title": step["title"],
+                    "fields": {}
+                }
+                
+                for field in step["fields"]:
+                    field_name = field["name"]
+                    
+                    if field_name in step_form_data:
+                        is_auto_filled = field_name in step_auto_fill
+                        is_overridden = field_name in step_overrides
+                        
+                        field_info = {
+                            "label": field["label"],
+                            "value": step_form_data[field_name],
+                            "type": field["type"],
+                            "is_auto_filled": is_auto_filled,
+                            "auto_fill_source": step_auto_fill.get(f"_auto_fill_source_{field_name}"),
+                            "confidence": step_auto_fill.get(f"_confidence_{field_name}"),
+                            "is_overridden": is_overridden,
+                            "original_auto_fill_value": step_overrides.get(field_name, {}).get("auto_fill_value"),
+                            "editable": True
+                        }
+                        
+                        review_data["steps"][step_id]["fields"][field_name] = field_info
+                        
+                        # Update summary
+                        review_data["summary"]["total_fields"] += 1
+                        if is_auto_filled:
+                            review_data["summary"]["auto_filled_fields"] += 1
+                        if is_overridden:
+                            review_data["summary"]["overridden_fields"] += 1
+                        if not is_auto_filled:
+                            review_data["summary"]["manual_fields"] += 1
+            
+            conn.close()
+            
+            return {
+                "success": True,
+                "review_data": review_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Review data error: {e}")
+            return {"success": False, "message": f"Failed to get review data: {str(e)}"}
+    
+    def submit_complete_form(self, user_id, session_id):
+        """Submit complete form with all validations"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get session data
+            cursor.execute('''
+                SELECT form_type, form_data, step_statuses, total_steps, 
+                       payment_completed, auto_fill_data, manual_overrides
+                FROM form_wizard_sessions
+                WHERE user_id = ? AND session_id = ?
+            ''', (user_id, session_id))
+            
+            result = cursor.fetchone()
+            if not result:
+                return {"success": False, "message": "Session not found"}
+            
+            form_type, form_data_str, step_statuses_str, total_steps, payment_completed, auto_fill_str, overrides_str = result
+            
+            # Validate payment completion
+            if not payment_completed:
+                return {"success": False, "message": "Payment must be completed before submission"}
+            
+            form_data = json.loads(form_data_str) if form_data_str else {}
+            auto_fill_data = json.loads(auto_fill_str) if auto_fill_str else {}
+            manual_overrides = json.loads(overrides_str) if overrides_str else {}
+            
+            # Get associated documents and payment
+            cursor.execute('''
+                SELECT id FROM document_uploads WHERE session_id = ?
+            ''', (session_id,))
+            document_ids = [row[0] for row in cursor.fetchall()]
+            
+            cursor.execute('''
+                SELECT id FROM payments WHERE session_id = ? AND status = 'completed'
+                ORDER BY created_at DESC LIMIT 1
+            ''', (session_id,))
+            payment_result = cursor.fetchone()
+            payment_id = payment_result[0] if payment_result else None
+            
+            # Create submission summary
+            auto_fill_summary = {
+                "total_auto_filled": sum(len([f for f in step.keys() if not f.startswith('_')]) 
+                                       for step in auto_fill_data.values()),
+                "sources_used": list(set([
+                    v for step in auto_fill_data.values() 
+                    for k, v in step.items() 
+                    if k.startswith('_auto_fill_source_')
+                ])),
+                "average_confidence": 0.85
+            }
+            
+            override_summary = {
+                "total_overridden": sum(len(step.keys()) for step in manual_overrides.values()),
+                "override_details": manual_overrides
+            }
+            
+            # Create form submission
+            cursor.execute('''
+                INSERT INTO form_submissions (
+                    user_id, session_id, form_type, form_data, document_ids,
+                    payment_id, auto_fill_summary, manual_override_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                user_id, session_id, form_type, 
+                json.dumps(form_data), json.dumps(document_ids),
+                payment_id, json.dumps(auto_fill_summary), json.dumps(override_summary)
+            ))
+            
+            submission_id = cursor.lastrowid
+            
+            # Mark wizard session as completed
+            cursor.execute('''
+                UPDATE form_wizard_sessions SET
+                    is_completed = 1,
+                    completed_at = CURRENT_TIMESTAMP,
+                    progress_percentage = 100,
+                    submission_status = 'submitted'
+                WHERE user_id = ? AND session_id = ?
+            ''', (user_id, session_id))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                "success": True,
+                "submission_id": submission_id,
+                "message": "Form submitted successfully",
+                "summary": {
+                    "auto_fill_summary": auto_fill_summary,
+                    "override_summary": override_summary,
+                    "payment_completed": True,
+                    "documents_uploaded": len(document_ids)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Submission error: {e}")
+            return {"success": False, "message": f"Submission failed: {str(e)}"}
 
-def extract_image_data(file_path: str, document_type: DocumentType) -> Dict[str, Any]:
-    """Extract data from image documents using OCR"""
-    extracted_data = {
-        "message": "Image processed successfully",
-        "file_type": "image",
-        "document_type": str(document_type),
-        "note": "OCR integration available in production"
-    }
-    return extracted_data
+# Flask Application
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
-def parse_w2_text(text: str) -> Dict[str, Any]:
-    """Parse W-2 form text for structured data"""
-    w2_data = {}
-    
-    # Basic regex patterns for W-2 fields
-    patterns = {
-        "wages": r"Wages, tips, other compensation\s*[\$]?([\d,]+\.?\d*)",
-        "federal_withholding": r"Federal income tax withheld\s*[\$]?([\d,]+\.?\d*)",
-        "social_security_wages": r"Social security wages\s*[\$]?([\d,]+\.?\d*)",
-        "employer_ein": r"Employer identification number\s*(\d{2}-\d{7})"
-    }
-    
-    for field, pattern in patterns.items():
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            w2_data[field] = match.group(1).replace(',', '')
-    
-    return w2_data
+# Initialize the tax system
+tax_system = CompleteTaxFormSystem()
 
-def parse_1099_text(text: str) -> Dict[str, Any]:
-    """Parse 1099 form text for structured data"""
-    form_1099_data = {}
-    
-    patterns = {
-        "nonemployee_compensation": r"Nonemployee compensation\s*[\$]?([\d,]+\.?\d*)",
-        "federal_withholding": r"Federal income tax withheld\s*[\$]?([\d,]+\.?\d*)",
-        "payer_tin": r"PAYER'S TIN\s*(\d{2}-\d{7})"
-    }
-    
-    for field, pattern in patterns.items():
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            form_1099_data[field] = match.group(1).replace(',', '')
-    
-    return form_1099_data
-
-# ────────────────────────────────────────────────────────────
-# HEALTH CHECK AND ROOT
-# ────────────────────────────────────────────────────────────
-@app.get("/health")
+# Health check endpoint for AWS
+@app.route('/health')
 def health_check():
-    """Health check endpoint for load balancers"""
-    return {
-        "status": "healthy", 
-        "timestamp": datetime.utcnow(),
-        "service": "TaxBox API",
-        "version": "1.0.0"
-    }
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
-@app.get("/")
-def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "TaxBox.AI - Comprehensive Tax Preparation API",
-        "version": "1.0.0",
-        "status": "operational",
-        "docs": "/docs",
-        "health": "/health",
-        "features": [
-            "User registration and authentication",
-            "Tax profile management", 
-            "Income record tracking",
-            "Deduction management",
-            "Document upload and processing",
-            "Third-party data imports"
-        ]
-    }
+# API Routes
+@app.route('/api/register', methods=['POST'])
+def register():
+    try:
+        data = request.json
+        if not data or 'email' not in data or 'password' not in data:
+            return jsonify({"success": False, "message": "Email and password required"})
+        return jsonify(tax_system.register_user(data['email'], data['password']))
+    except Exception as e:
+        logger.error(f"Register endpoint error: {e}")
+        return jsonify({"success": False, "message": "Registration failed"})
 
-# ────────────────────────────────────────────────────────────
-# AUTH ENDPOINTS
-# ────────────────────────────────────────────────────────────
-def create_access_token(data: dict, expires_delta: timedelta):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + expires_delta
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+@app.route('/api/login', methods=['POST'])
+def login():
+    try:
+        data = request.json
+        if not data or 'email' not in data or 'password' not in data:
+            return jsonify({"success": False, "message": "Email and password required"})
+        return jsonify(tax_system.login_user(data['email'], data['password']))
+    except Exception as e:
+        logger.error(f"Login endpoint error: {e}")
+        return jsonify({"success": False, "message": "Login failed"})
 
-def hash_password(password: str) -> str:
-    return bcrypt.hash(password)
+@app.route('/api/dashboard', methods=['POST'])
+def dashboard():
+    try:
+        data = request.json
+        if not data or 'user_id' not in data:
+            return jsonify({"success": False, "message": "User ID required"})
+        return jsonify(tax_system.get_dashboard_data(data['user_id']))
+    except Exception as e:
+        logger.error(f"Dashboard endpoint error: {e}")
+        return jsonify({"success": False, "message": "Dashboard failed"})
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.verify(plain_password, hashed_password)
+@app.route('/api/start_wizard', methods=['POST'])
+def start_wizard():
+    try:
+        data = request.json
+        if not data or 'user_id' not in data or 'form_type' not in data:
+            return jsonify({"success": False, "message": "User ID and form type required"})
+        return jsonify(tax_system.start_form_wizard(data['user_id'], data['form_type']))
+    except Exception as e:
+        logger.error(f"Start wizard endpoint error: {e}")
+        return jsonify({"success": False, "message": "Failed to start wizard"})
 
-class RegisterIn(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=8)
-    first_name: str
-    last_name: str
-    date_of_birth: str
-    phone: Optional[str] = None
-    address: Optional[str] = None
+@app.route('/api/resume_session', methods=['POST'])
+def resume_session():
+    try:
+        data = request.json
+        if not data or 'user_id' not in data or 'session_id' not in data:
+            return jsonify({"success": False, "message": "User ID and session ID required"})
+        return jsonify(tax_system.get_session_data(data['user_id'], data['session_id']))
+    except Exception as e:
+        logger.error(f"Resume session endpoint error: {e}")
+        return jsonify({"success": False, "message": "Failed to resume session"})
 
-class TokenOut(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
+@app.route('/api/upload_document', methods=['POST'])
+def upload_document():
+    try:
+        user_id = request.form.get('user_id')
+        session_id = request.form.get('session_id')
+        form_type = request.form.get('form_type')
+        
+        if not all([user_id, session_id, form_type]):
+            return jsonify({"success": False, "message": "Missing required parameters"})
+        
+        if 'file' not in request.files:
+            return jsonify({"success": False, "message": "No file uploaded"})
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"success": False, "message": "No file selected"})
+        
+        # Save file
+        filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
+        file_path = os.path.join(tax_system.upload_dir, filename)
+        file.save(file_path)
+        
+        # Extract data and apply auto-fill
+        extraction_result = tax_system.extract_data_from_document(file_path, form_type)
+        if extraction_result["success"]:
+            auto_fill_result = tax_system.apply_auto_fill_to_session(
+                user_id, session_id, extraction_result["extracted_data"]
+            )
+            return jsonify({
+                "success": True,
+                "extraction_result": extraction_result,
+                "auto_fill_result": auto_fill_result
+            })
+        
+        return jsonify(extraction_result)
+    except Exception as e:
+        logger.error(f"Upload document endpoint error: {e}")
+        return jsonify({"success": False, "message": "Upload failed"})
 
-class MFASetupOut(BaseModel):
-    message: str
-    otp_auth_uri: str
-    secret: str
+@app.route('/api/create_stripe_payment', methods=['POST'])
+def create_stripe_payment():
+    try:
+        data = request.json
+        if not data or not all(k in data for k in ['user_id', 'session_id', 'amount', 'payment_type']):
+            return jsonify({"success": False, "message": "Missing required parameters"})
+        return jsonify(tax_system.create_stripe_payment_intent(
+            data['user_id'], data['session_id'], data['amount'], data['payment_type']
+        ))
+    except Exception as e:
+        logger.error(f"Stripe payment endpoint error: {e}")
+        return jsonify({"success": False, "message": "Payment creation failed"})
 
-@app.post("/register", response_model=MFASetupOut, status_code=201)
-def register(data: RegisterIn, db: Session = Depends(get_db)):
-    """Register a new user with MFA setup"""
-    if db.query(User).filter_by(email=data.email.lower()).first():
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    mfa_secret = pyotp.random_base32()
-    user = User(
-        email=data.email.lower(),
-        password_hash=hash_password(data.password),
-        mfa_secret=mfa_secret,
-    )
-    
-    profile = Profile(
-        first_name=data.first_name,
-        last_name=data.last_name,
-        date_of_birth=data.date_of_birth,
-        phone=data.phone,
-        address=data.address,
-    )
-    user.profile = profile
-    
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    
-    otp_uri = pyotp.totp.TOTP(mfa_secret).provisioning_uri(
-        name=user.email, issuer_name="TaxBox.AI"
-    )
-    
-    return MFASetupOut(
-        message="Registration successful. Set up MFA with your authenticator app.",
-        otp_auth_uri=otp_uri,
-        secret=mfa_secret,
-    )
+@app.route('/api/confirm_stripe_payment', methods=['POST'])
+def confirm_stripe_payment():
+    try:
+        data = request.json
+        if not data or not all(k in data for k in ['payment_intent_id', 'payment_method_id']):
+            return jsonify({"success": False, "message": "Missing required parameters"})
+        return jsonify(tax_system.confirm_stripe_payment(
+            data['payment_intent_id'], data['payment_method_id']
+        ))
+    except Exception as e:
+        logger.error(f"Stripe confirm endpoint error: {e}")
+        return jsonify({"success": False, "message": "Payment confirmation failed"})
 
-@app.post("/token", response_model=TokenOut)
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """Login with email, password, and MFA code"""
-    mfa_code = form.scopes[0] if form.scopes else None
-    user = db.query(User).filter_by(email=form.username.lower()).first()
-    
-    if not user or not verify_password(form.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-    
-    if not mfa_code or not pyotp.TOTP(user.mfa_secret).verify(mfa_code):
-        raise HTTPException(status_code=401, detail="Invalid MFA code")
-    
-    access_token = create_access_token(
-        data={"sub": user.id}, 
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MIN)
-    )
-    
-    return TokenOut(access_token=access_token)
+@app.route('/api/create_paypal_order', methods=['POST'])
+def create_paypal_order():
+    try:
+        data = request.json
+        if not data or not all(k in data for k in ['user_id', 'session_id', 'amount', 'payment_type']):
+            return jsonify({"success": False, "message": "Missing required parameters"})
+        return jsonify(tax_system.create_paypal_order(
+            data['user_id'], data['session_id'], data['amount'], data['payment_type']
+        ))
+    except Exception as e:
+        logger.error(f"PayPal order endpoint error: {e}")
+        return jsonify({"success": False, "message": "PayPal order creation failed"})
 
-@app.get("/me")
-def get_current_user_info(current_user: User = Depends(get_current_user)):
-    """Get current user information"""
-    return {
-        "id": current_user.id,
-        "email": current_user.email,
-        "identity_verified": current_user.identity_verified,
-        "created_at": current_user.created_at,
-    }
+@app.route('/api/capture_paypal_payment', methods=['POST'])
+def capture_paypal_payment():
+    try:
+        data = request.json
+        if not data or 'order_id' not in data:
+            return jsonify({"success": False, "message": "Order ID required"})
+        return jsonify(tax_system.capture_paypal_payment(data['order_id']))
+    except Exception as e:
+        logger.error(f"PayPal capture endpoint error: {e}")
+        return jsonify({"success": False, "message": "PayPal capture failed"})
 
-# ────────────────────────────────────────────────────────────
-# TAX PROFILE ENDPOINTS
-# ────────────────────────────────────────────────────────────
-@app.post("/tax-profile", response_model=TaxProfileOut)
-def create_tax_profile(
-    profile_data: TaxProfileIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Create or update tax profile with personal information"""
-    existing_profile = db.query(TaxProfile).filter_by(user_id=current_user.id).first()
-    
-    if existing_profile:
-        # Update existing profile
-        for field, value in profile_data.dict().items():
-            setattr(existing_profile, field, value)
-        tax_profile = existing_profile
-    else:
-        # Create new profile
-        tax_profile = TaxProfile(user_id=current_user.id, **profile_data.dict())
-        db.add(tax_profile)
-    
-    db.commit()
-    db.refresh(tax_profile)
-    return tax_profile
+@app.route('/api/get_review_data', methods=['POST'])
+def get_review_data():
+    try:
+        data = request.json
+        if not data or not all(k in data for k in ['user_id', 'session_id']):
+            return jsonify({"success": False, "message": "User ID and session ID required"})
+        return jsonify(tax_system.get_comprehensive_review_data(data['user_id'], data['session_id']))
+    except Exception as e:
+        logger.error(f"Review data endpoint error: {e}")
+        return jsonify({"success": False, "message": "Failed to get review data"})
 
-@app.get("/tax-profile", response_model=TaxProfileOut)
-def get_tax_profile(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get current user's tax profile"""
-    tax_profile = db.query(TaxProfile).filter_by(user_id=current_user.id).first()
-    if not tax_profile:
-        raise HTTPException(status_code=404, detail="Tax profile not found")
-    return tax_profile
+@app.route('/api/submit_form', methods=['POST'])
+def submit_form():
+    try:
+        data = request.json
+        if not data or not all(k in data for k in ['user_id', 'session_id']):
+            return jsonify({"success": False, "message": "User ID and session ID required"})
+        return jsonify(tax_system.submit_complete_form(data['user_id'], data['session_id']))
+    except Exception as e:
+        logger.error(f"Submit form endpoint error: {e}")
+        return jsonify({"success": False, "message": "Form submission failed"})
 
-# ────────────────────────────────────────────────────────────
-# INCOME ENDPOINTS
-# ────────────────────────────────────────────────────────────
-@app.post("/income/w2", response_model=IncomeRecordOut)
-def add_w2_income(
-    w2_data: W2IncomeIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add W-2 income record"""
-    income_record = IncomeRecord(
-        user_id=current_user.id,
-        income_type=IncomeType.W2,
-        employer_name=w2_data.employer_name,
-        employer_ein=w2_data.employer_ein,
-        gross_income=w2_data.gross_income,
-        federal_withholding=w2_data.federal_withholding,
-        state_withholding=w2_data.state_withholding,
-        social_security_wages=w2_data.social_security_wages,
-        medicare_wages=w2_data.medicare_wages,
-        state_wages=w2_data.state_wages,
-        additional_data={
-            "retirement_plan": w2_data.retirement_plan,
-            "statutory_employee": w2_data.statutory_employee
-        }
-    )
-    
-    db.add(income_record)
-    db.commit()
-    db.refresh(income_record)
-    return income_record
+@app.route('/')
+def index():
+    return render_template_string(COMPLETE_FRONTEND_HTML)
 
-@app.post("/income/1099", response_model=IncomeRecordOut)
-def add_1099_income(
-    form_1099_data: Form1099In,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add 1099 income record"""
-    income_record = IncomeRecord(
-        user_id=current_user.id,
-        income_type=form_1099_data.income_type,
-        employer_name=form_1099_data.payer_name,
-        employer_ein=form_1099_data.payer_tin,
-        gross_income=form_1099_data.amount,
-        federal_withholding=form_1099_data.federal_withholding,
-        state_withholding=form_1099_data.state_withholding,
-        additional_data=form_1099_data.additional_info
-    )
-    
-    db.add(income_record)
-    db.commit()
-    db.refresh(income_record)
-    return income_record
+# Error handlers
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Not found"}), 404
 
-@app.post("/income/self-employment", response_model=IncomeRecordOut)
-def add_self_employment_income(
-    se_data: SelfEmploymentIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add self-employment income record"""
-    income_record = IncomeRecord(
-        user_id=current_user.id,
-        income_type=IncomeType.SELF_EMPLOYMENT,
-        employer_name=se_data.business_name,
-        gross_income=se_data.gross_receipts,
-        additional_data={
-            "business_type": se_data.business_type,
-            "total_expenses": str(se_data.total_expenses),
-            "net_profit": str(se_data.net_profit),
-            "schedule_c_expenses": {k: str(v) for k, v in se_data.schedule_c_expenses.items()}
-        }
-    )
-    
-    db.add(income_record)
-    db.commit()
-    db.refresh(income_record)
-    return income_record
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
 
-@app.get("/income", response_model=List[IncomeRecordOut])
-def get_income_records(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get all income records for current user"""
-    return db.query(IncomeRecord).filter_by(user_id=current_user.id).all()
-
-# ────────────────────────────────────────────────────────────
-# DEDUCTION ENDPOINTS
-# ────────────────────────────────────────────────────────────
-@app.post("/deductions/itemized", response_model=DeductionRecordOut)
-def add_itemized_deduction(
-    deduction_data: ItemizedDeductionIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add itemized deduction record"""
-    deduction_record = DeductionRecord(
-        user_id=current_user.id,
-        deduction_type=DeductionType.ITEMIZED,
-        category=deduction_data.category,
-        description=deduction_data.description,
-        amount=deduction_data.amount,
-        state_specific=deduction_data.state_specific,
-        state=deduction_data.state,
-        additional_data={"supporting_documents": deduction_data.supporting_documents}
-    )
-    
-    db.add(deduction_record)
-    db.commit()
-    db.refresh(deduction_record)
-    return deduction_record
-
-@app.post("/credits/education", response_model=DeductionRecordOut)
-def add_education_credit(
-    education_data: EducationCreditIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add education credit record"""
-    deduction_record = DeductionRecord(
-        user_id=current_user.id,
-        deduction_type=DeductionType.ITEMIZED,
-        category="education_credit",
-        description=f"Education credit for {education_data.student_name}",
-        amount=education_data.tuition_paid,
-        additional_data={
-            "student_name": education_data.student_name,
-            "student_ssn": education_data.student_ssn,
-            "institution_name": education_data.institution_name,
-            "institution_ein": education_data.institution_ein,
-            "qualified_expenses": str(education_data.qualified_expenses),
-            "form_1098t_received": education_data.form_1098t_received
-        }
-    )
-    
-    db.add(deduction_record)
-    db.commit()
-    db.refresh(deduction_record)
-    return deduction_record
-
-@app.post("/credits/child-tax", response_model=DeductionRecordOut)
-def add_child_tax_credit(
-    child_data: ChildTaxCreditIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add child tax credit record"""
-    # Calculate credit amount based on 2023 rules
-    credit_amount = 2000 if child_data.under_age_17 else 500
-    
-    deduction_record = DeductionRecord(
-        user_id=current_user.id,
-        deduction_type=DeductionType.ITEMIZED,
-        category="child_tax_credit",
-        description=f"Child tax credit for {child_data.child_name}",
-        amount=credit_amount,
-        additional_data={
-            "child_name": child_data.child_name,
-            "child_ssn": child_data.child_ssn,
-            "relationship": child_data.relationship,
-            "months_lived_with_you": child_data.months_lived_with_you,
-            "under_age_17": child_data.under_age_17,
-            "us_citizen": child_data.us_citizen
-        }
-    )
-    
-    db.add(deduction_record)
-    db.commit()
-    db.refresh(deduction_record)
-    return deduction_record
-
-@app.post("/deductions/state-specific", response_model=DeductionRecordOut)
-def add_state_specific_deduction(
-    state_data: StateSpecificIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Add state-specific deduction"""
-    deduction_record = DeductionRecord(
-        user_id=current_user.id,
-        deduction_type=DeductionType.ITEMIZED,
-        category=state_data.deduction_type,
-        description=state_data.description,
-        amount=state_data.amount,
-        state_specific=True,
-        state=state_data.state,
-        additional_data=state_data.additional_data
-    )
-    
-    db.add(deduction_record)
-    db.commit()
-    db.refresh(deduction_record)
-    return deduction_record
-
-@app.get("/deductions", response_model=List[DeductionRecordOut])
-def get_deduction_records(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get all deduction records for current user"""
-    return db.query(DeductionRecord).filter_by(user_id=current_user.id).all()
-
-# ────────────────────────────────────────────────────────────
-# DOCUMENT UPLOAD ENDPOINTS
-# ────────────────────────────────────────────────────────────
-@app.post("/documents/upload", response_model=DocumentOut)
-def upload_tax_document(
-    file: UploadFile = File(...),
-    document_type: DocumentType = Form(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Upload and process tax documents (PDF, images)"""
-    
-    # Validate file type
-    allowed_types = ['application/pdf', 'image/jpeg', 'image/png', 'image/tiff']
-    if file.content_type not in allowed_types:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"File type {file.content_type} not allowed. Use PDF or image files."
-        )
-    
-    # Generate unique filename
-    file_extension = os.path.splitext(file.filename)[1]
-    unique_filename = f"{current_user.id}_{uuid.uuid4()}{file_extension}"
-    file_path = os.path.join(UPLOAD_DIR, unique_filename)
-    
-    # Save file
-    with open(file_path, "wb") as buffer:
-        content = file.file.read()
-        buffer.write(content)
-    
-    # Create document record
-    document = Document(
-        user_id=current_user.id,
-        filename=unique_filename,
-        original_filename=file.filename,
-        document_type=document_type,
-        file_path=file_path,
-        file_size=len(content),
-        mime_type=file.content_type
-    )
-    
-    db.add(document)
-    db.commit()
-    db.refresh(document)
-    
-    # Process document
-    extracted_data = process_document(file_path, document_type)
-    document.extracted_data = extracted_data
-    document.processed = True
-    db.commit()
-    
-    return document
-
-@app.get("/documents", response_model=List[DocumentOut])
-def get_documents(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get all uploaded documents for current user"""
-    return db.query(Document).filter_by(user_id=current_user.id).all()
-
-@app.get("/documents/{document_id}/extracted-data")
-def get_extracted_data(
-    document_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get extracted data from processed document"""
-    document = db.query(Document).filter_by(
-        id=document_id, 
-        user_id=current_user.id
-    ).first()
-    
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    return {
-        "document_id": document.id,
-        "processed": document.processed,
-        "extracted_data": document.extracted_data
-    }
-
-# ────────────────────────────────────────────────────────────
-# THIRD-PARTY IMPORT ENDPOINTS (Simplified for demo)
-# ────────────────────────────────────────────────────────────
-@app.post("/import/payroll")
-def import_from_payroll(
-    import_request: ImportRequestIn,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Import data from payroll providers (ADP, Paychex, etc.)"""
-    
-    # Create import session
-    import_session = ImportSession(
-        user_id=current_user.id,
-        provider=import_request.provider,
-        status="success",
-        imported_data={
-            "provider": import_request.provider.value,
-            "records_imported": 1,
-            "data_types": import_request.data_types,
-            "message": "Demo import completed successfully"
-        },
-        completed_at=datetime.utcnow()
-    )
-    db.add(import_session)
-    db.commit()
-    db.refresh(import_session)
-    
-    return {
-        "message": f"Import from {import_request.provider} completed",
-        "session_id": import_session.id,
-        "status": "success"
-    }
-
-@app.get("/import/status/{session_id}")
-def get_import_status(
-    session_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """Get status of import session"""
-    import_session = db.query(ImportSession).filter_by(
-        id=session_id,
-        user_id=current_user.id
-    ).first()
-    
-    if not import_session:
-        raise HTTPException(status_code=404, detail="Import session not found")
-    
-    return {
-        "session_id": import_session.id,
-        "provider": import_session.provider,
-        "status": import_session.status,
-        "created_at": import_session.created_at,
-        "completed_at": import_session.completed_at,
-        "error_message": import_session.error_message,
-        "imported_records": len(import_session.imported_data.get("records", []))
-    }
-
-# ────────────────────────────────────────────────────────────
-# MAIN
-# ────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+# Complete Frontend HTML
+COMPLETE_FRONTEND_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
